@@ -298,6 +298,31 @@ def ensure_deps(packages_only: bool = False):
                       check=False).returncode != 0:
         print("  !! chromium download failed - run: "
               "python -m playwright install chromium")
+        return
+    if os.name == "posix":
+        # A fresh download on Linux (e.g. Google Colab) still needs chromium's
+        # system libraries (libatk, libnss3, ...). Colab runs as root so this
+        # just works; elsewhere it may need sudo - failure is not fatal here,
+        # the launcher retries install-deps if the first launch fails.
+        print("Installing chromium system libraries "
+              "(one-time, ~2-4 min; needs root/sudo)...")
+        subprocess.run([sys.executable, "-m", "playwright", "install-deps",
+                        "chromium"], check=False)
+
+
+def _is_missing_libs_error(exc: Exception) -> bool:
+    """True when chromium failed to launch for lack of system libraries.
+
+    Playwright >=1.49 reports this as TargetClosedError whose text embeds
+    the browser log line 'error while loading shared libraries: libatk...'
+    (the older 'Host system is missing dependencies' wording also exists).
+    """
+    if os.name != "posix":
+        return False
+    msg = str(exc).lower()
+    return ("missing dependencies" in msg
+            or "error while loading shared libraries" in msg
+            or "libatk" in msg)
 
 
 def run_async(coro):
@@ -421,14 +446,21 @@ async def run_browser_mode(args, cats) -> list:
             browser = await pw.chromium.launch(headless=not args.headed,
                                                args=LAUNCH_ARGS)
         except Exception as exc:
-            # Fresh Colab/Linux VMs sometimes lack chromium's system libraries
-            if "missing dependencies" in str(exc).lower() and os.name == "posix":
-                print("System libraries missing - running "
-                      "'playwright install-deps chromium' (needs root/sudo)...")
+            # Fresh Colab/Linux VMs often lack chromium's system libraries
+            if _is_missing_libs_error(exc):
+                print("Chromium system libraries are missing (libatk, libnss3, "
+                      "...) - running 'playwright install-deps chromium' "
+                      "(one-time, ~2-4 min, needs root/sudo)...")
                 subprocess.run([sys.executable, "-m", "playwright",
                                 "install-deps", "chromium"], check=False)
-                browser = await pw.chromium.launch(headless=not args.headed,
-                                                   args=LAUNCH_ARGS)
+                try:
+                    browser = await pw.chromium.launch(headless=not args.headed,
+                                                       args=LAUNCH_ARGS)
+                except Exception as exc2:
+                    raise RuntimeError(
+                        "Chromium still fails to launch. Run this in a Colab "
+                        "cell and retry:  !playwright install-deps chromium\n"
+                        f"Original error: {str(exc2)[:300]}") from exc2
             else:
                 raise
         ctx = await browser.new_context(
