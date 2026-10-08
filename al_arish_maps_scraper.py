@@ -24,6 +24,20 @@ Two modes
    Places API.  Needs a key with "Places API (New)" enabled:
        python al_arish_maps_scraper.py --api-key YOUR_KEY
 
+Google Colab (plain .py file - no notebook needed)
+--------------------------------------------------
+The script is Colab-ready and self-installs everything it needs
+(playwright, chromium, nest_asyncio) on first run:
+
+    # upload this file, then in a Colab cell:
+    !python al_arish_maps_scraper.py --per-category 20
+
+Both launch styles work: `!python ...` (fresh process) and `%run ...`
+(inside the kernel - the script detects the already-running event loop
+and applies nest_asyncio automatically). Output files land in /content;
+grab them from the file browser in the left sidebar. Skip the self-setup
+with --no-setup once you have pre-installed the dependencies yourself.
+
 Useful flags
 ------------
     --per-category 20                  limit listings per category (default 60)
@@ -32,6 +46,7 @@ Useful flags
     --headed                           show the browser window (debug)
     --out results/al_arish             output base name -> .csv / .json / _raw.jsonl
     --dry-run                          just print the planned searches and exit
+    --no-setup                         skip automatic dependency installation
 
 Outputs
 -------
@@ -51,10 +66,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import glob
 import json
 import os
 import random
 import re
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -116,6 +133,9 @@ EMAIL_BAD_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".css",
 SOCIAL_SKIP = ("facebook.com", "instagram.com", "whatsapp.com", "twitter.com",
                "x.com", "tiktok.com", "youtube.com", "linktr.ee", "waze.com",
                "google.com", "goo.gl")
+
+# Google Colab / Jupyter detection (affects setup hints and event-loop handling)
+IN_COLAB = bool(os.environ.get("COLAB_RELEASE_TAG")) or os.path.isdir("/content")
 
 # Google Places API (New) -----------------------------------------------------
 API_TEXT_SEARCH = "https://places.googleapis.com/v1/places:searchText"
@@ -222,6 +242,83 @@ def harvest_email(site: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Environment setup - makes the script run on Google Colab as-is               #
+# --------------------------------------------------------------------------- #
+
+def _pip_install(packages: list) -> bool:
+    """pip install quietly; retry with --break-system-packages on PEP668 boxes."""
+    cmd = [sys.executable, "-m", "pip", "install", "-q"] + packages
+    print("Installing python package(s):", " ".join(packages))
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0 and "externally-managed-environment" in (r.stderr or ""):
+        r = subprocess.run(cmd + ["--break-system-packages"],
+                           capture_output=True, text=True)
+    if r.returncode != 0:
+        print((r.stderr or r.stdout or "").strip()[-800:])
+        return False
+    return True
+
+
+def chromium_cached() -> bool:
+    """True when a playwright chromium build is already on disk."""
+    root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if not root:
+        if sys.platform == "darwin":
+            root = os.path.expanduser("~/Library/Caches/ms-playwright")
+        elif os.name == "nt":
+            root = os.path.expandvars(r"%LOCALAPPDATA%\ms-playwright")
+        else:
+            root = os.path.expanduser("~/.cache/ms-playwright")
+    # chrome-linux/ (older) or chrome-linux64/ (newer) - both accepted
+    return bool(glob.glob(os.path.join(root, "chromium-*", "chrome-linux*", "chrome")))
+
+
+def ensure_deps(packages_only: bool = False):
+    """Self-install python packages (+ chromium browser) when missing.
+
+    This is what makes the script work on a fresh Google Colab VM without
+    any manual pip/install steps. On a machine that already has everything
+    every check below is a cheap no-op. Skip with --no-setup.
+    """
+    missing = []
+    for pkg, mod in (("playwright", "playwright"), ("requests", "requests"),
+                     ("nest_asyncio", "nest_asyncio")):
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append(pkg)
+    if missing and not _pip_install(missing):
+        sys.exit("Automatic install failed - run manually:\n"
+                 "    pip install playwright requests nest_asyncio")
+
+    if packages_only or chromium_cached():
+        return
+    print("Downloading chromium for playwright (one-time, ~150 MB)...")
+    if subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"],
+                      check=False).returncode != 0:
+        print("  !! chromium download failed - run: "
+              "python -m playwright install chromium")
+
+
+def run_async(coro):
+    """asyncio.run() that also works inside the Google Colab / Jupyter kernel.
+
+    The IPython kernel already runs an event loop, so a plain asyncio.run()
+    would die with 'asyncio.run() cannot be called from a running event
+    loop'. When a running loop is detected we apply nest_asyncio first,
+    which makes the nested call legal. Normal terminal runs take the
+    simple asyncio.run() path unchanged.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:                 # plain script: no loop running yet
+        return asyncio.run(coro)
+    import nest_asyncio                  # loop already running (Colab / %run)
+    nest_asyncio.apply()
+    return asyncio.run(coro)
+
+
+# --------------------------------------------------------------------------- #
 # Browser-mode scraping                                                        #
 # --------------------------------------------------------------------------- #
 
@@ -320,7 +417,20 @@ async def run_browser_mode(args, cats) -> list:
     rows: list = []
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=not args.headed, args=LAUNCH_ARGS)
+        try:
+            browser = await pw.chromium.launch(headless=not args.headed,
+                                               args=LAUNCH_ARGS)
+        except Exception as exc:
+            # Fresh Colab/Linux VMs sometimes lack chromium's system libraries
+            if "missing dependencies" in str(exc).lower() and os.name == "posix":
+                print("System libraries missing - running "
+                      "'playwright install-deps chromium' (needs root/sudo)...")
+                subprocess.run([sys.executable, "-m", "playwright",
+                                "install-deps", "chromium"], check=False)
+                browser = await pw.chromium.launch(headless=not args.headed,
+                                                   args=LAUNCH_ARGS)
+            else:
+                raise
         ctx = await browser.new_context(
             user_agent=USER_AGENT, locale="en-US", timezone_id="Africa/Cairo",
             viewport={"width": 1366, "height": 850})
@@ -460,6 +570,9 @@ def parse_args():
                    help="Google Places API (New) key -> use API mode instead of a browser")
     p.add_argument("--dry-run", action="store_true",
                    help="print the planned searches and exit")
+    p.add_argument("--no-setup", action="store_true",
+                   help="skip automatic dependency installation (playwright, "
+                        "chromium, nest_asyncio) - Colab self-setup")
     return p.parse_args()
 
 
@@ -490,9 +603,13 @@ def main():
 
     t0 = time.time()
     if args.api_key:
+        if not args.no_setup:
+            ensure_deps(packages_only=True)   # API mode only needs requests
         rows = run_api_mode(args, cats)
     else:
-        rows = asyncio.run(run_browser_mode(args, cats))
+        if not args.no_setup:
+            ensure_deps()
+        rows = run_async(run_browser_mode(args, cats))
 
     if not args.no_dedupe:
         rows = dedupe(rows)
@@ -501,6 +618,9 @@ def main():
     print(f"\n--- done: {len(rows)} unique place(s) in {time.time() - t0:.0f}s ---")
     print(f"    {json_path}")
     print(f"    {csv_path}")
+    if IN_COLAB:
+        print("    (Colab: files are in /content - use the file browser in the "
+              "left sidebar, or run files.download('%s') in a cell)" % csv_path)
 
 
 if __name__ == "__main__":
