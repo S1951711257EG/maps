@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+nohup.out
+# heavy build artifacts (rebuildable via deploy/setup_*.sh)
+data/*.pbf
+data/osrm/
+data/tiles/

@@ -1,0 +1,52 @@
+# Al Arish Maps API - full self-hosted stack
+#
+#   api    -> this FastAPI service          http://localhost:8000
+#   osrm   -> road router (car profile)     http://localhost:5000
+#   tiles  -> vector map tiles (Al Arish)   http://localhost:8090
+#
+# Before the first start:
+#   bash deploy/setup_osrm.sh     # Egypt extract -> Al Arish router files
+#   bash deploy/setup_tiles.sh    # Al Arish -> mbtiles + map style
+#   python3 scripts/build_db.py   # rebuild SQLite gazetteer (already committed)
+# Then:
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#
+# Every service keeps running without the others: the API falls back to
+# straight-line routing when OSRM is down, and /geocode works from SQLite.
+
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      OSRM_URL: "http://osrm:5000"
+      TILE_STYLE_URL: "http://localhost:8090/styles/al-arish/style.json"
+      TILE_PBF_URL: "http://localhost:8090/data/al-arish/{z}/{x}/{y}.pbf"
+      # ALLOW_ONLINE_GEOCODE: "0"     # uncomment to stay 100% offline
+      # API_KEY: "change-me"          # uncomment to require X-API-Key header
+    volumes:
+      - ../data:/app/data
+    depends_on:
+      - osrm
+    restart: unless-stopped
+
+  osrm:
+    image: osrm/osrm-backend:latest
+    command: osrm-routed --algorithm mld /data/al-arish.osrm
+    ports:
+      - "5000:5000"
+    volumes:
+      - ../data/osrm:/data
+    restart: unless-stopped
+
+  tiles:
+    image: maptiler/tileserver-gl:latest
+    command: --config /data/config.json
+    ports:
+      - "8090:8080"
+    volumes:
+      - ../data/tiles:/data
+    restart: unless-stopped
